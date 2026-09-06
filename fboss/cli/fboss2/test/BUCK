@@ -135,6 +135,8 @@ cpp_unittest(
         "CmdShowArpTest.cpp",
         "CmdShowBgpChangelistTest.cpp",
         "CmdShowBgpHealthTest.cpp",
+        "CmdShowBgpHoldTimersWikiDocsTest.cpp",
+        "CmdShowBgpInitializationEventsTest.cpp",
         "CmdShowBgpNeighborsAdvertisedPostPolicyTest.cpp",
         "CmdShowBgpNeighborsAdvertisedPrePolicyTest.cpp",
         "CmdShowBgpNeighborsAdvertisedRejectedTest.cpp",

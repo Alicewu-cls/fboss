@@ -102,6 +102,8 @@ add_executable(fboss2_cmd_test
   fboss/cli/fboss2/test/CanonicalRibResolverTest.cpp
   fboss/cli/fboss2/test/CmdShowBgpChangelistTest.cpp
   fboss/cli/fboss2/test/CmdShowBgpHealthTest.cpp
+  fboss/cli/fboss2/test/CmdShowBgpHoldTimersWikiDocsTest.cpp
+  fboss/cli/fboss2/test/CmdShowBgpInitializationEventsTest.cpp
   fboss/cli/fboss2/test/CmdShowBgpNeighborsAdvertisedPostPolicyTest.cpp
   fboss/cli/fboss2/test/CmdShowBgpNeighborsAdvertisedPrePolicyTest.cpp
   fboss/cli/fboss2/test/CmdShowBgpNeighborsAdvertisedRejectedTest.cpp
