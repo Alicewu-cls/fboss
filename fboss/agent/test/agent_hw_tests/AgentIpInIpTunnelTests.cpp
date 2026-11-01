@@ -14,6 +14,7 @@
 #include "fboss/agent/hw/test/HwTestCoppUtils.h"
 #include "fboss/agent/hw/test/HwTestPacketUtils.h"
 #include "fboss/agent/packet/EthFrame.h"
+#include "fboss/agent/packet/Ethertype.h"
 #include "fboss/agent/packet/IPPacket.h"
 #include "fboss/agent/test/AgentHwTest.h"
 #include "fboss/agent/test/EcmpSetupHelper.h"
@@ -273,6 +274,7 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
   std::string kEncapDstIp = "2401:db00:ffff::1";
   std::string kTargetPrefix = "2403:300::";
   int kTargetPrefixLen = 32;
+  std::string kV4TargetPrefix = "100.0.0.0/24";
 
   std::vector<ProductionFeature> getProductionFeaturesVerified()
       const override {
@@ -336,6 +338,18 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     }
     cfg.dataPlaneTrafficPolicy()->matchToAction()->push_back(mta);
 
+    cfg::AclEntry aclV4;
+    aclV4.name() = "acl_encap_v4";
+    aclV4.dstIp() = kV4TargetPrefix;
+    aclV4.proto() = 6;
+    aclV4.l4DstPort() = 443;
+    utility::addAcl(&cfg, aclV4, cfg::AclStage::INGRESS);
+
+    cfg::MatchToAction mtaV4;
+    mtaV4.matcher() = "acl_encap_v4";
+    mtaV4.action() = action;
+    cfg.dataPlaneTrafficPolicy()->matchToAction()->push_back(mtaV4);
+
     utility::addTrapPacketAcl(
         asic,
         &cfg,
@@ -385,31 +399,124 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
         dstPort,
         trafficClass);
   }
+
+  void sendEncapPacket(bool cpuInject, std::unique_ptr<TxPacket> pkt) {
+    if (cpuInject) {
+      getAgentEnsemble()->ensureSendPacketSwitched(std::move(pkt));
+    } else {
+      getAgentEnsemble()->ensureSendPacketOutOfPort(
+          std::move(pkt), masterLogicalPortIds()[0]);
+    }
+  }
+
+  void verifyEncapPacketParsing(bool isV4, bool cpuInject) {
+    constexpr uint8_t kDscp{48};
+    // makeTcpPacket builds the inner packet with hop limit / TTL 255.
+    // Forwarding decrements it once, so under the UNIFORM TTL mode both
+    // the inner header and the outer header carry 254.
+    constexpr uint8_t kExpectedHopLimit{254};
+    const std::string dstIp = isV4 ? "100.0.0.1" : "2403:300::1";
+    utility::SwSwitchPacketSnooper snooper(getSw(), "snooper");
+    auto txPacket = makeTcpPacket(dstIp, 443, kDscp);
+    // makeEthFrame applies the same forwarding decrement to its copy,
+    // so the expected inner packet already carries the decremented
+    // hop limit / TTL.
+    const auto origFrame = utility::makeEthFrame(*txPacket);
+    sendEncapPacket(cpuInject, std::move(txPacket));
+    auto capturedPktBuf = snooper.waitForPacket(1);
+    ASSERT_TRUE(capturedPktBuf.has_value());
+
+    folly::io::Cursor capturedPktCursor{capturedPktBuf->get()};
+    auto capturedPkt = utility::EthFrame(capturedPktCursor);
+    EXPECT_EQ(
+        capturedPkt.header().etherType,
+        static_cast<uint16_t>(ETHERTYPE::ETHERTYPE_IPV6));
+    auto v6Pkt = capturedPkt.v6PayLoad();
+    ASSERT_TRUE(v6Pkt.has_value());
+    auto outerHdr = v6Pkt->header();
+
+    EXPECT_EQ(outerHdr.srcAddr, folly::IPAddress(kEncapSrcIp));
+    EXPECT_EQ(outerHdr.dstAddr, folly::IPAddress(kEncapDstIp));
+    EXPECT_EQ(outerHdr.nextHeader, isV4 ? 4 : 41);
+    EXPECT_EQ(outerHdr.trafficClass >> 2, kDscp);
+    EXPECT_EQ(outerHdr.trafficClass & 0x3, 0);
+    EXPECT_EQ(outerHdr.hopLimit, kExpectedHopLimit);
+
+    if (isV4) {
+      const auto origInnerPkt = origFrame.v4PayLoad();
+      ASSERT_TRUE(origInnerPkt.has_value());
+      const auto* innerPkt = v6Pkt->v4PayLoad();
+      ASSERT_TRUE(innerPkt != nullptr);
+      const auto innerHdr = innerPkt->header();
+      EXPECT_EQ(innerHdr.dstAddr, folly::IPAddressV4("100.0.0.1"));
+      EXPECT_EQ(innerHdr.srcAddr, folly::IPAddressV4("1.1.1.2"));
+      EXPECT_EQ(innerHdr.protocol, 6);
+      EXPECT_EQ(innerHdr.dscp, kDscp);
+      EXPECT_EQ(innerHdr.ecn, 0);
+      EXPECT_EQ(innerHdr.ttl, kExpectedHopLimit);
+      // The inner packet must survive encapsulation with only the TTL
+      // changed: header, TCP header, and payload equal the original.
+      EXPECT_EQ(*innerPkt, *origInnerPkt);
+    } else {
+      const auto origInnerPkt = origFrame.v6PayLoad();
+      ASSERT_TRUE(origInnerPkt.has_value());
+      const auto* innerPkt = v6Pkt->v6PayLoad();
+      ASSERT_TRUE(innerPkt != nullptr);
+      EXPECT_EQ(innerPkt->header().hopLimit, kExpectedHopLimit);
+      // The inner packet must survive encapsulation with only the hop
+      // limit changed: header, TCP header, and payload equal the
+      // original packet.
+      EXPECT_EQ(*innerPkt, *origInnerPkt);
+    }
+  }
 };
 
 TEST_F(AgentIpInIpEncapTunnelTest, EncapTunnelForwarding) {
   auto setup = [=, this]() { setupHelper(); };
   auto verify = [=, this]() {
-    auto beforeInBytes =
-        getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
-    auto beforeEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
-    auto beforeNonEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
-    getAgentEnsemble()->ensureSendPacketOutOfPort(
-        makeTcpPacket(), masterLogicalPortIds()[0]);
-    auto afterInBytes =
-        getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
-    auto afterEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
-    auto afterNonEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
-    // Encapped packet exits encap egress port (port 1) with added outer header
-    EXPECT_EQ(
-        afterInBytes - beforeInBytes + IPv6Hdr::SIZE,
-        afterEncapOutBytes - beforeEncapOutBytes);
-    // Non-encap egress port (port 2) should see no traffic
-    EXPECT_EQ(afterNonEncapOutBytes, beforeNonEncapOutBytes);
+    int64_t frontPanelEncapDeltaV4 = 0;
+    int64_t frontPanelEncapDeltaV6 = 0;
+    for (bool isV4 : {false, true}) {
+      for (bool cpuInject : {false, true}) {
+        auto beforeInBytes =
+            getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
+        auto beforeEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        auto beforeNonEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
+        sendEncapPacket(
+            cpuInject, makeTcpPacket(isV4 ? "100.0.0.1" : "2403:300::1"));
+        auto afterInBytes =
+            getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
+        auto afterEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        auto afterNonEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
+        auto encapDelta = afterEncapOutBytes - beforeEncapOutBytes;
+        auto nonEncapDelta = afterNonEncapOutBytes - beforeNonEncapOutBytes;
+        if (!cpuInject) {
+          // Encapped packet exits encap egress port (port 1) with added
+          // outer header.
+          EXPECT_EQ(afterInBytes - beforeInBytes + IPv6Hdr::SIZE, encapDelta);
+          // Non-encap egress port (port 2) should see no traffic.
+          EXPECT_EQ(nonEncapDelta, 0);
+          if (isV4) {
+            frontPanelEncapDeltaV4 = encapDelta;
+          } else {
+            frontPanelEncapDeltaV6 = encapDelta;
+          }
+        } else {
+          // CPU-injected packets do not ingress a front-panel port, so
+          // port 0 inBytes does not move. The encap egress delta must
+          // match the front-panel delta for the same packet.
+          EXPECT_GT(encapDelta, 0);
+          EXPECT_EQ(
+              encapDelta,
+              isV4 ? frontPanelEncapDeltaV4 : frontPanelEncapDeltaV6);
+          EXPECT_EQ(nonEncapDelta, 0);
+        }
+      }
+    }
   };
   verifyAcrossWarmBoots(setup, verify);
 }
@@ -417,28 +524,43 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapTunnelForwarding) {
 TEST_F(AgentIpInIpEncapTunnelTest, EncapAclMiss) {
   auto setup = [=, this]() { setupHelper(); };
   auto verify = [=, this]() {
-    auto beforeInBytes =
-        getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
-    auto beforeEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
-    auto beforeNonEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
-    getAgentEnsemble()->ensureSendPacketOutOfPort(
-        makeTcpPacket("2620:0:1::1"), masterLogicalPortIds()[0]);
-    auto afterInBytes =
-        getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
-    auto afterEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
-    auto afterNonEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
-    EXPECT_NE(afterInBytes, beforeInBytes);
-    // Non-encapped packet exits non-encap egress port (port 2, default route)
-    EXPECT_NE(afterNonEncapOutBytes, beforeNonEncapOutBytes);
-    EXPECT_EQ(
-        afterInBytes - beforeInBytes,
-        afterNonEncapOutBytes - beforeNonEncapOutBytes);
-    // Encap egress port (port 1) should see no traffic
-    EXPECT_EQ(afterEncapOutBytes, beforeEncapOutBytes);
+    for (bool isV4 : {false, true}) {
+      for (bool cpuInject : {false, true}) {
+        auto beforeInBytes =
+            getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
+        auto beforeEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        auto beforeNonEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
+        sendEncapPacket(
+            cpuInject, makeTcpPacket(isV4 ? "100.0.1.1" : "2620:0:1::1"));
+        auto afterInBytes =
+            getLatestPortStats(masterLogicalPortIds()[0]).inBytes_().value();
+        auto afterEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        auto afterNonEncapOutBytes =
+            getLatestPortStats(masterLogicalPortIds()[2]).outBytes_().value();
+        // A missed packet must never be encapped.
+        EXPECT_EQ(afterEncapOutBytes, beforeEncapOutBytes);
+        if (!isV4 && !cpuInject) {
+          EXPECT_NE(afterInBytes, beforeInBytes);
+          // Non-encapped packet exits non-encap egress port (port 2,
+          // default route).
+          EXPECT_NE(afterNonEncapOutBytes, beforeNonEncapOutBytes);
+          EXPECT_EQ(
+              afterInBytes - beforeInBytes,
+              afterNonEncapOutBytes - beforeNonEncapOutBytes);
+        } else if (!isV4) {
+          // CPU-injected packets do not move port 0 inBytes, but the
+          // missed packet must still egress unencapped on port 2.
+          EXPECT_NE(afterNonEncapOutBytes, beforeNonEncapOutBytes);
+        } else if (!cpuInject) {
+          // No IPv4 default route is programmed, so only the no-encap
+          // property is asserted for IPv4 misses.
+          EXPECT_NE(afterInBytes, beforeInBytes);
+        }
+      }
+    }
   };
   verifyAcrossWarmBoots(setup, verify);
 }
@@ -446,44 +568,11 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapAclMiss) {
 TEST_F(AgentIpInIpEncapTunnelTest, EncapPacketParsing) {
   auto setup = [=, this]() { setupHelper(); };
   auto verify = [=, this]() {
-    constexpr uint8_t kDscp{48};
-    // makeTcpPacket builds the inner packet with hop limit 255.
-    // Forwarding decrements it once, so under the UNIFORM TTL mode both
-    // the inner header and the outer header carry 254.
-    constexpr uint8_t kExpectedHopLimit{254};
-    utility::SwSwitchPacketSnooper snooper(getSw(), "snooper");
-    auto txPacket = makeTcpPacket("2403:300::1", 443, kDscp);
-    // makeEthFrame applies the same forwarding decrement to its copy,
-    // so the expected inner packet already carries the decremented
-    // hop limit.
-    const auto origFrame = utility::makeEthFrame(*txPacket);
-    const auto origInnerPkt = origFrame.v6PayLoad();
-    ASSERT_TRUE(origInnerPkt.has_value());
-    getAgentEnsemble()->ensureSendPacketOutOfPort(
-        std::move(txPacket), masterLogicalPortIds()[0]);
-    auto capturedPktBuf = snooper.waitForPacket(1);
-    ASSERT_TRUE(capturedPktBuf.has_value());
-
-    folly::io::Cursor capturedPktCursor{capturedPktBuf->get()};
-    auto capturedPkt = utility::EthFrame(capturedPktCursor);
-    auto v6Pkt = capturedPkt.v6PayLoad();
-    ASSERT_TRUE(v6Pkt.has_value());
-    auto outerHdr = v6Pkt->header();
-
-    EXPECT_EQ(outerHdr.srcAddr, folly::IPAddress(kEncapSrcIp));
-    EXPECT_EQ(outerHdr.dstAddr, folly::IPAddress(kEncapDstIp));
-    EXPECT_EQ(outerHdr.nextHeader, 41);
-    EXPECT_EQ(outerHdr.trafficClass >> 2, kDscp);
-    EXPECT_EQ(outerHdr.trafficClass & 0x3, 0);
-    EXPECT_EQ(outerHdr.hopLimit, kExpectedHopLimit);
-
-    const auto* innerPkt = v6Pkt->v6PayLoad();
-    ASSERT_TRUE(innerPkt != nullptr);
-    EXPECT_EQ(innerPkt->header().hopLimit, kExpectedHopLimit);
-    // The inner packet must survive encapsulation with only the hop
-    // limit changed: header, TCP header, and payload equal the
-    // original packet.
-    EXPECT_EQ(*innerPkt, *origInnerPkt);
+    for (bool isV4 : {false, true}) {
+      for (bool cpuInject : {false, true}) {
+        verifyEncapPacketParsing(isV4, cpuInject);
+      }
+    }
   };
   verifyAcrossWarmBoots(setup, verify);
 }
