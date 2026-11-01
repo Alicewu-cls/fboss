@@ -400,6 +400,32 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
         trafficClass);
   }
 
+  // Build a TCP packet with the given DSCP and ECN. makeTcpPacket
+  // only exposes DSCP, and the IPv4 builders do not expose ECN at
+  // all, so ECN-marked packets are built only for IPv6 here, with
+  // the full traffic-class byte.
+  std::unique_ptr<TxPacket>
+  makeTcpPacketWithTc(const std::string& dstIp, uint8_t dscp, uint8_t ecn) {
+    if (ecn == 0) {
+      return makeTcpPacket(dstIp, 443, dscp);
+    }
+    auto vlanId =
+        VlanID(*initialConfig(*getAgentEnsemble()).vlanPorts()[0].vlanID());
+    auto intfMac = utility::getInterfaceMac(getProgrammedState(), vlanId);
+    auto srcMac = folly::MacAddress::fromHBO(intfMac.u64HBO() + 1);
+    return utility::makeTCPTxPacket(
+        getSw(),
+        vlanId,
+        srcMac,
+        intfMac,
+        folly::IPAddressV6("1::10"),
+        folly::IPAddressV6(dstIp),
+        10000,
+        443,
+        static_cast<uint8_t>((dscp << 2) | ecn),
+        255);
+  }
+
   void sendEncapPacket(bool cpuInject, std::unique_ptr<TxPacket> pkt) {
     if (cpuInject) {
       getAgentEnsemble()->ensureSendPacketSwitched(std::move(pkt));
@@ -409,22 +435,49 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     }
   }
 
-  void verifyEncapPacketParsing(bool isV4, bool cpuInject) {
-    constexpr uint8_t kDscp{48};
-    // makeTcpPacket builds the inner packet with hop limit / TTL 255.
-    // Forwarding decrements it once, so under the UNIFORM TTL mode both
-    // the inner header and the outer header carry 254.
+  void verifyEncapPacketParsing(
+      bool isV4,
+      bool cpuInject,
+      uint8_t dscp,
+      uint8_t ecn) {
+    // The inner packet is built with hop limit / TTL 255. Forwarding
+    // decrements it once, so under the UNIFORM TTL mode both the
+    // inner header and the outer header carry 254.
     constexpr uint8_t kExpectedHopLimit{254};
     const std::string dstIp = isV4 ? "100.0.0.1" : "2403:300::1";
     utility::SwSwitchPacketSnooper snooper(getSw(), "snooper");
-    auto txPacket = makeTcpPacket(dstIp, 443, kDscp);
+    auto txPacket = makeTcpPacketWithTc(dstIp, dscp, ecn);
     // makeEthFrame applies the same forwarding decrement to its copy,
     // so the expected inner packet already carries the decremented
     // hop limit / TTL.
     const auto origFrame = utility::makeEthFrame(*txPacket);
+    auto beforeEncapOutBytes =
+        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
     sendEncapPacket(cpuInject, std::move(txPacket));
-    auto capturedPktBuf = snooper.waitForPacket(1);
+    // Retry the capture so a timeout or a stray non-encap packet
+    // captured first does not fail the test. Only a packet headed
+    // to the tunnel endpoint counts as the encapsulated packet.
+    std::optional<std::unique_ptr<folly::IOBuf>> capturedPktBuf;
+    for (int attempt = 0; attempt < 3; ++attempt) {
+      capturedPktBuf = snooper.waitForPacket(1);
+      if (!capturedPktBuf.has_value()) {
+        continue;
+      }
+      folly::io::Cursor probeCursor{capturedPktBuf->get()};
+      auto probeFrame = utility::EthFrame(probeCursor);
+      auto probeOuter = probeFrame.v6PayLoad();
+      if (probeOuter.has_value() &&
+          probeOuter->header().dstAddr == folly::IPAddress(kEncapDstIp)) {
+        break;
+      }
+      capturedPktBuf.reset();
+    }
     ASSERT_TRUE(capturedPktBuf.has_value());
+    auto afterEncapOutBytes =
+        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+    // The packet must have egressed the encap port, not just been
+    // captured somewhere by the snooper.
+    EXPECT_GT(afterEncapOutBytes, beforeEncapOutBytes);
 
     folly::io::Cursor capturedPktCursor{capturedPktBuf->get()};
     auto capturedPkt = utility::EthFrame(capturedPktCursor);
@@ -438,8 +491,8 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     EXPECT_EQ(outerHdr.srcAddr, folly::IPAddress(kEncapSrcIp));
     EXPECT_EQ(outerHdr.dstAddr, folly::IPAddress(kEncapDstIp));
     EXPECT_EQ(outerHdr.nextHeader, isV4 ? 4 : 41);
-    EXPECT_EQ(outerHdr.trafficClass >> 2, kDscp);
-    EXPECT_EQ(outerHdr.trafficClass & 0x3, 0);
+    EXPECT_EQ(outerHdr.trafficClass >> 2, dscp);
+    EXPECT_EQ(outerHdr.trafficClass & 0x3, ecn);
     EXPECT_EQ(outerHdr.hopLimit, kExpectedHopLimit);
 
     if (isV4) {
@@ -451,8 +504,8 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
       EXPECT_EQ(innerHdr.dstAddr, folly::IPAddressV4("100.0.0.1"));
       EXPECT_EQ(innerHdr.srcAddr, folly::IPAddressV4("1.1.1.2"));
       EXPECT_EQ(innerHdr.protocol, 6);
-      EXPECT_EQ(innerHdr.dscp, kDscp);
-      EXPECT_EQ(innerHdr.ecn, 0);
+      EXPECT_EQ(innerHdr.dscp, dscp);
+      EXPECT_EQ(innerHdr.ecn, ecn);
       EXPECT_EQ(innerHdr.ttl, kExpectedHopLimit);
       // The inner packet must survive encapsulation with only the TTL
       // changed: header, TCP header, and payload equal the original.
@@ -462,7 +515,9 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
       ASSERT_TRUE(origInnerPkt.has_value());
       const auto* innerPkt = v6Pkt->v6PayLoad();
       ASSERT_TRUE(innerPkt != nullptr);
-      EXPECT_EQ(innerPkt->header().hopLimit, kExpectedHopLimit);
+      const auto innerHdr = innerPkt->header();
+      EXPECT_EQ(innerHdr.hopLimit, kExpectedHopLimit);
+      EXPECT_EQ(innerHdr.trafficClass, static_cast<uint8_t>((dscp << 2) | ecn));
       // The inner packet must survive encapsulation with only the hop
       // limit changed: header, TCP header, and payload equal the
       // original packet.
@@ -570,7 +625,16 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapPacketParsing) {
   auto verify = [=, this]() {
     for (bool isV4 : {false, true}) {
       for (bool cpuInject : {false, true}) {
-        verifyEncapPacketParsing(isV4, cpuInject);
+        for (uint8_t dscp : {uint8_t{0}, uint8_t{32}, uint8_t{48}}) {
+          verifyEncapPacketParsing(isV4, cpuInject, dscp, 0);
+        }
+        // ECN is only exposed by the IPv6 packet builders, so the
+        // ECN sweep is IPv6-only.
+        if (!isV4) {
+          for (uint8_t ecn : {uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
+            verifyEncapPacketParsing(isV4, cpuInject, 48, ecn);
+          }
+        }
       }
     }
   };
