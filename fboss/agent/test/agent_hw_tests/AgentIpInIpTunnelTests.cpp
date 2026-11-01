@@ -13,6 +13,8 @@
 #include "fboss/agent/hw/test/ConfigFactory.h"
 #include "fboss/agent/hw/test/HwTestCoppUtils.h"
 #include "fboss/agent/hw/test/HwTestPacketUtils.h"
+#include "fboss/agent/packet/EthFrame.h"
+#include "fboss/agent/packet/IPPacket.h"
 #include "fboss/agent/test/AgentHwTest.h"
 #include "fboss/agent/test/EcmpSetupHelper.h"
 #include "fboss/agent/test/ResourceLibUtil.h"
@@ -445,15 +447,27 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapPacketParsing) {
   auto setup = [=, this]() { setupHelper(); };
   auto verify = [=, this]() {
     constexpr uint8_t kDscp{48};
+    // makeTcpPacket builds the inner packet with hop limit 255.
+    // Forwarding decrements it once, so under the UNIFORM TTL mode both
+    // the inner header and the outer header carry 254.
+    constexpr uint8_t kExpectedHopLimit{254};
     utility::SwSwitchPacketSnooper snooper(getSw(), "snooper");
+    auto txPacket = makeTcpPacket("2403:300::1", 443, kDscp);
+    // makeEthFrame applies the same forwarding decrement to its copy,
+    // so the expected inner packet already carries the decremented
+    // hop limit.
+    const auto origFrame = utility::makeEthFrame(*txPacket);
+    const auto origInnerPkt = origFrame.v6PayLoad();
+    ASSERT_TRUE(origInnerPkt.has_value());
     getAgentEnsemble()->ensureSendPacketOutOfPort(
-        makeTcpPacket("2403:300::1", 443, kDscp), masterLogicalPortIds()[0]);
+        std::move(txPacket), masterLogicalPortIds()[0]);
     auto capturedPktBuf = snooper.waitForPacket(1);
     ASSERT_TRUE(capturedPktBuf.has_value());
 
     folly::io::Cursor capturedPktCursor{capturedPktBuf->get()};
     auto capturedPkt = utility::EthFrame(capturedPktCursor);
     auto v6Pkt = capturedPkt.v6PayLoad();
+    ASSERT_TRUE(v6Pkt.has_value());
     auto outerHdr = v6Pkt->header();
 
     EXPECT_EQ(outerHdr.srcAddr, folly::IPAddress(kEncapSrcIp));
@@ -461,6 +475,15 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapPacketParsing) {
     EXPECT_EQ(outerHdr.nextHeader, 41);
     EXPECT_EQ(outerHdr.trafficClass >> 2, kDscp);
     EXPECT_EQ(outerHdr.trafficClass & 0x3, 0);
+    EXPECT_EQ(outerHdr.hopLimit, kExpectedHopLimit);
+
+    const auto* innerPkt = v6Pkt->v6PayLoad();
+    ASSERT_TRUE(innerPkt != nullptr);
+    EXPECT_EQ(innerPkt->header().hopLimit, kExpectedHopLimit);
+    // The inner packet must survive encapsulation with only the hop
+    // limit changed: header, TCP header, and payload equal the
+    // original packet.
+    EXPECT_EQ(*innerPkt, *origInnerPkt);
   };
   verifyAcrossWarmBoots(setup, verify);
 }
