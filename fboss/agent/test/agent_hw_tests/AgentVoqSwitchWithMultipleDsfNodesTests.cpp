@@ -340,17 +340,16 @@ TEST_F(
   const auto ipB = folly::IPAddress("2401:db00:e702:58:1000::1");
 
   auto logRoutes = [this](const std::string& phase) {
-    auto fibV6 = getProgrammedState()
-                     ->getFibsInfoMap()
-                     ->getFibContainer(RouterID(0))
-                     ->getFibV6();
+    auto state = getProgrammedState();
+    auto fibV6 =
+        state->getFibsInfoMap()->getFibContainer(RouterID(0))->getFibV6();
     XLOG(DBG2) << "=== Remote interface routes (" << phase << ") ===";
     for (const auto& [_, route] : std::as_const(*fibV6)) {
       auto entry = route->getEntryForClient(ClientID::REMOTE_INTERFACE_ROUTE);
       if (!entry) {
         continue;
       }
-      auto nhops = entry->getNextHopSet();
+      auto nhops = getClientNextHops(state, *entry);
       XLOG(DBG2) << "  " << route->prefix().network() << "/"
                  << route->prefix().mask() << " -> "
                  << (nhops.empty()
@@ -427,16 +426,15 @@ TEST_F(
   auto verify = [&, this]() {
     logRoutes("verify: current state");
     WITH_RETRIES({
-      auto fibV6 = getProgrammedState()
-                       ->getFibsInfoMap()
-                       ->getFibContainer(RouterID(0))
-                       ->getFibV6();
+      auto state = getProgrammedState();
+      auto fibV6 =
+          state->getFibsInfoMap()->getFibContainer(RouterID(0))->getFibV6();
       // Both prefixes must exist, owned by the swapped interfaces
       auto routeForB = fibV6->exactMatch(prefixA);
       EXPECT_EVENTUALLY_NE(routeForB, nullptr);
       if (routeForB) {
         EXPECT_TRUE(routeForB->isConnected());
-        auto nhops = routeForB->getForwardInfo().getNextHopSet();
+        auto nhops = getNextHops(state, routeForB->getForwardInfo());
         ASSERT_EQ(nhops.size(), 1);
         EXPECT_EQ(nhops.begin()->intf(), InterfaceID(remotePortIdB));
       }
@@ -444,7 +442,7 @@ TEST_F(
       EXPECT_EVENTUALLY_NE(routeForA, nullptr);
       if (routeForA) {
         EXPECT_TRUE(routeForA->isConnected());
-        auto nhops = routeForA->getForwardInfo().getNextHopSet();
+        auto nhops = getNextHops(state, routeForA->getForwardInfo());
         ASSERT_EQ(nhops.size(), 1);
         EXPECT_EQ(nhops.begin()->intf(), InterfaceID(remotePortIdA));
       }
