@@ -468,7 +468,8 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
       bool isV4,
       bool cpuInject,
       uint8_t dscp,
-      uint8_t ecn) {
+      uint8_t ecn,
+      PortID egressPort) {
     // The inner packet is built with hop limit / TTL 255. Forwarding
     // decrements it once, so under the UNIFORM TTL mode both the
     // inner header and the outer header carry 254.
@@ -481,7 +482,7 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     // hop limit / TTL.
     const auto origFrame = utility::makeEthFrame(*txPacket);
     auto beforeEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        getLatestPortStats(egressPort).outBytes_().value();
     sendEncapPacket(cpuInject, std::move(txPacket));
     // Retry the capture so a timeout or a stray non-encap packet
     // captured first does not fail the test. Only a packet headed
@@ -503,7 +504,7 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     }
     ASSERT_TRUE(capturedPktBuf.has_value());
     auto afterEncapOutBytes =
-        getLatestPortStats(masterLogicalPortIds()[1]).outBytes_().value();
+        getLatestPortStats(egressPort).outBytes_().value();
     // The packet must have egressed the encap port, not just been
     // captured somewhere by the snooper.
     EXPECT_GT(afterEncapOutBytes, beforeEncapOutBytes);
@@ -658,17 +659,48 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapPacketParsing) {
     for (bool isV4 : {false, true}) {
       for (bool cpuInject : {false, true}) {
         for (uint8_t dscp : {uint8_t{0}, uint8_t{32}, uint8_t{48}}) {
-          verifyEncapPacketParsing(isV4, cpuInject, dscp, 0);
+          verifyEncapPacketParsing(
+              isV4, cpuInject, dscp, 0, masterLogicalPortIds()[1]);
         }
         // ECN is only exposed by the IPv6 packet builders, so the
         // ECN sweep is IPv6-only.
         if (!isV4) {
           for (uint8_t ecn : {uint8_t{1}, uint8_t{2}, uint8_t{3}}) {
-            verifyEncapPacketParsing(isV4, cpuInject, 48, ecn);
+            verifyEncapPacketParsing(
+                isV4, cpuInject, 48, ecn, masterLogicalPortIds()[1]);
           }
         }
       }
     }
+  };
+  verifyAcrossWarmBoots(setup, verify);
+}
+
+TEST_F(AgentIpInIpEncapTunnelTest, EncapRouteUpdateMovesEgressPort) {
+  auto setup = [=, this]() { setupHelper(); };
+  auto verify = [=, this]() {
+    auto origPort = masterLogicalPortIds()[1];
+    auto newPort = masterLogicalPortIds()[2];
+    auto verifyOnPort = [&, this](PortID egressPort, PortID idlePort) {
+      auto beforeIdleOutBytes =
+          getLatestPortStats(idlePort).outBytes_().value();
+      verifyEncapPacketParsing(false, false, 48, 0, egressPort);
+      EXPECT_EQ(
+          getLatestPortStats(idlePort).outBytes_().value(), beforeIdleOutBytes);
+    };
+    // Baseline: encapped out of the original port.
+    verifyOnPort(origPort, newPort);
+    // Move the underlay route resolving the tunnel destination to
+    // the new port.
+    setupRouteToPort(newPort, folly::IPAddressV6(kEncapDstIp), 64);
+    // Encapped out of the new port, and actually encapped: the
+    // parsing verification checks the outer headers and the inner
+    // packet.
+    verifyOnPort(newPort, origPort);
+    // Bring back the original route.
+    setupRouteToPort(origPort, folly::IPAddressV6(kEncapDstIp), 64);
+    // Encapped out of the original port again.
+    verifyOnPort(origPort, newPort);
   };
   verifyAcrossWarmBoots(setup, verify);
 }
