@@ -358,21 +358,48 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
             ensemble.masterLogicalPortIds()[2]});
   }
 
-  void setupRouteToPort(
-      const PortID& portID,
+  void setupRouteToPorts(
+      const std::vector<PortID>& portIDs,
       const folly::IPAddressV6& dstIp,
       uint8_t prefixLen) {
     utility::EcmpSetupTargetedPorts6 ecmpHelper{
         getProgrammedState(), getSw()->needL2EntryForNeighbor()};
-    auto dstPort = PortDescriptor(portID);
+    boost::container::flat_set<PortDescriptor> dstPorts;
+    for (const auto& portID : portIDs) {
+      dstPorts.insert(PortDescriptor(portID));
+    }
     applyNewState([&](const std::shared_ptr<SwitchState>& in) {
-      return ecmpHelper.resolveNextHops(in, {dstPort});
+      return ecmpHelper.resolveNextHops(in, dstPorts);
     });
     auto wrapper = getSw()->getRouteUpdater();
     ecmpHelper.programRoutes(
         &wrapper,
-        {dstPort},
+        dstPorts,
         {RoutePrefix<folly::IPAddressV6>{dstIp, prefixLen}});
+  }
+
+  void setupRouteToPort(
+      const PortID& portID,
+      const folly::IPAddressV6& dstIp,
+      uint8_t prefixLen) {
+    setupRouteToPorts({portID}, dstIp, prefixLen);
+  }
+
+  // Drop the neighbor entry for a port, then resolve it again, so
+  // the port rejoins the ECMP group after a link flap instead of
+  // staying shrunk out of the group.
+  void unresolveAndResolveNextHop(const PortID& portID) {
+    auto dstPort = PortDescriptor(portID);
+    applyNewState([&](const std::shared_ptr<SwitchState>& in) {
+      utility::EcmpSetupTargetedPorts6 ecmpHelper{
+          getProgrammedState(), getSw()->needL2EntryForNeighbor()};
+      return ecmpHelper.unresolveNextHops(in, {dstPort});
+    });
+    applyNewState([&](const std::shared_ptr<SwitchState>& in) {
+      utility::EcmpSetupTargetedPorts6 ecmpHelper{
+          getProgrammedState(), getSw()->needL2EntryForNeighbor()};
+      return ecmpHelper.resolveNextHops(in, {dstPort});
+    });
   }
 
   void setupHelper() {
@@ -464,12 +491,17 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     });
   }
 
-  void verifyEncapPacketParsing(
+  // Verify the packet is encapped, and report which of the given
+  // ports it egressed. Exactly one of the ports must carry the
+  // encapped packet; the parsing checks below apply to the captured
+  // packet regardless of which port it used.
+  void verifyEncapPacketParsingOnPorts(
       bool isV4,
       bool cpuInject,
       uint8_t dscp,
       uint8_t ecn,
-      PortID egressPort) {
+      const std::vector<PortID>& egressPorts,
+      PortID& usedPort) {
     // The inner packet is built with hop limit / TTL 255. Forwarding
     // decrements it once, so under the UNIFORM TTL mode both the
     // inner header and the outer header carry 254.
@@ -481,8 +513,11 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     // so the expected inner packet already carries the decremented
     // hop limit / TTL.
     const auto origFrame = utility::makeEthFrame(*txPacket);
-    auto beforeEncapOutBytes =
-        getLatestPortStats(egressPort).outBytes_().value();
+    std::vector<int64_t> beforeEncapOutBytes;
+    for (const auto& egressPort : egressPorts) {
+      beforeEncapOutBytes.push_back(
+          getLatestPortStats(egressPort).outBytes_().value());
+    }
     sendEncapPacket(cpuInject, std::move(txPacket));
     // Retry the capture so a timeout or a stray non-encap packet
     // captured first does not fail the test. Only a packet headed
@@ -503,11 +538,17 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
       capturedPktBuf.reset();
     }
     ASSERT_TRUE(capturedPktBuf.has_value());
-    auto afterEncapOutBytes =
-        getLatestPortStats(egressPort).outBytes_().value();
-    // The packet must have egressed the encap port, not just been
-    // captured somewhere by the snooper.
-    EXPECT_GT(afterEncapOutBytes, beforeEncapOutBytes);
+    // The packet must have egressed exactly one of the given ports,
+    // not just been captured somewhere by the snooper.
+    std::vector<PortID> movedPorts;
+    for (size_t i = 0; i < egressPorts.size(); ++i) {
+      if (getLatestPortStats(egressPorts[i]).outBytes_().value() >
+          beforeEncapOutBytes[i]) {
+        movedPorts.push_back(egressPorts[i]);
+      }
+    }
+    EXPECT_EQ(movedPorts.size(), 1);
+    usedPort = movedPorts.empty() ? egressPorts.front() : movedPorts.front();
 
     folly::io::Cursor capturedPktCursor{capturedPktBuf->get()};
     auto capturedPkt = utility::EthFrame(capturedPktCursor);
@@ -553,6 +594,18 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
       // original packet.
       EXPECT_EQ(*innerPkt, *origInnerPkt);
     }
+  }
+
+  void verifyEncapPacketParsing(
+      bool isV4,
+      bool cpuInject,
+      uint8_t dscp,
+      uint8_t ecn,
+      PortID egressPort) {
+    PortID usedPort = egressPort;
+    verifyEncapPacketParsingOnPorts(
+        isV4, cpuInject, dscp, ecn, {egressPort}, usedPort);
+    EXPECT_EQ(usedPort, egressPort);
   }
 };
 
@@ -701,6 +754,72 @@ TEST_F(AgentIpInIpEncapTunnelTest, EncapRouteUpdateMovesEgressPort) {
     setupRouteToPort(origPort, folly::IPAddressV6(kEncapDstIp), 64);
     // Encapped out of the original port again.
     verifyOnPort(origPort, newPort);
+  };
+  verifyAcrossWarmBoots(setup, verify);
+}
+
+TEST_F(AgentIpInIpEncapTunnelTest, EncapEcmpRoutePortDownUp) {
+  auto setup = [=, this]() { setupHelper(); };
+  auto verify = [=, this]() {
+    auto port1 = masterLogicalPortIds()[1];
+    auto port2 = masterLogicalPortIds()[2];
+    const std::vector<PortID> ecmpPorts{port1, port2};
+    auto encapDst = folly::IPAddressV6(kEncapDstIp);
+    auto verifyOnPort = [&, this](PortID egressPort, PortID idlePort) {
+      auto beforeIdleOutBytes =
+          getLatestPortStats(idlePort).outBytes_().value();
+      verifyEncapPacketParsing(false, false, 48, 0, egressPort);
+      EXPECT_EQ(
+          getLatestPortStats(idlePort).outBytes_().value(), beforeIdleOutBytes);
+    };
+
+    // Phase 1: the covering route resolves to an ECMP group. The
+    // encapped packet goes out of one of the two ports.
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 1: ECMP covering route "
+               << "over ports " << port1 << " and " << port2;
+    setupRouteToPorts(ecmpPorts, encapDst, 64);
+    PortID usedPort = port1;
+    verifyEncapPacketParsingOnPorts(false, false, 48, 0, ecmpPorts, usedPort);
+    if (HasFailure()) {
+      XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 1 failed";
+      return;
+    }
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 1 passed: encap "
+               << "egressed port " << usedPort;
+    auto downPort = usedPort;
+    auto upPort = downPort == port1 ? port2 : port1;
+
+    // Phase 2: bring down the port the encapped packet used. Encap
+    // forwarding moves to the remaining port.
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 2: bringing down port "
+               << downPort << ", expecting encap on port " << upPort;
+    bringDownPort(downPort);
+    verifyOnPort(upPort, downPort);
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 2 done";
+
+    // Phase 3: narrow the covering route to the remaining up port.
+    // Encap forwarding stays on that port.
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 3: narrowing covering "
+               << "route to port " << upPort;
+    setupRouteToPorts({upPort}, encapDst, 64);
+    verifyOnPort(upPort, downPort);
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 3 done";
+
+    // Phase 4: bring the down port back, cycle its neighbor so it
+    // rejoins the ECMP group, and widen the route to the ECMP group
+    // again. The encapped packet goes out of one of the two ports.
+    XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 4: bringing up port "
+               << downPort << " and widening covering route to ECMP";
+    bringUpPort(downPort);
+    unresolveAndResolveNextHop(downPort);
+    setupRouteToPorts(ecmpPorts, encapDst, 64);
+    verifyEncapPacketParsingOnPorts(false, false, 48, 0, ecmpPorts, usedPort);
+    if (HasFailure()) {
+      XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 4 failed";
+    } else {
+      XLOG(INFO) << "EncapEcmpRoutePortDownUp phase 4 passed: encap "
+                 << "egressed port " << usedPort;
+    }
   };
   verifyAcrossWarmBoots(setup, verify);
 }
