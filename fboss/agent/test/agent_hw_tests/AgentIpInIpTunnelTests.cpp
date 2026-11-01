@@ -435,6 +435,35 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
     }
   }
 
+  // Front-panel only: send a matching packet before any underlay
+  // route is programmed and verify it is dropped as a null-route
+  // discard. Called from the forwarding test's setup, which
+  // verifyAcrossWarmBoots skips on warm boot, so this runs cold
+  // only. The packet is sent asynchronously: it is expected to drop,
+  // so the ensure* helpers, which wait for egress, do not apply.
+  void verifyEncapDropBeforeRoute() {
+    auto ingressPort = masterLogicalPortIds()[0];
+    auto encapPort = masterLogicalPortIds()[1];
+    auto defaultPort = masterLogicalPortIds()[2];
+    auto before = getLatestPortStats(ingressPort);
+    auto beforeNullDiscards = *before.inDstNullDiscards_();
+    auto beforeEncapOutBytes =
+        getLatestPortStats(encapPort).outBytes_().value();
+    auto beforeDefaultOutBytes =
+        getLatestPortStats(defaultPort).outBytes_().value();
+    getSw()->sendPacketOutOfPortAsync(makeTcpPacket(), ingressPort);
+    WITH_RETRIES({
+      auto after = getLatestPortStats(ingressPort);
+      EXPECT_EVENTUALLY_GT(*after.inDstNullDiscards_(), beforeNullDiscards);
+      EXPECT_EVENTUALLY_EQ(
+          getLatestPortStats(encapPort).outBytes_().value(),
+          beforeEncapOutBytes);
+      EXPECT_EVENTUALLY_EQ(
+          getLatestPortStats(defaultPort).outBytes_().value(),
+          beforeDefaultOutBytes);
+    });
+  }
+
   void verifyEncapPacketParsing(
       bool isV4,
       bool cpuInject,
@@ -527,7 +556,10 @@ class AgentIpInIpEncapTunnelTest : public AgentHwTest {
 };
 
 TEST_F(AgentIpInIpEncapTunnelTest, EncapTunnelForwarding) {
-  auto setup = [=, this]() { setupHelper(); };
+  auto setup = [=, this]() {
+    verifyEncapDropBeforeRoute();
+    setupHelper();
+  };
   auto verify = [=, this]() {
     int64_t frontPanelEncapDeltaV4 = 0;
     int64_t frontPanelEncapDeltaV6 = 0;
