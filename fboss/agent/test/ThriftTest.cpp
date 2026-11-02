@@ -23,6 +23,7 @@
 #include "fboss/agent/gen-cpp2/switch_config_types.h"
 #include "fboss/agent/hw/mock/MockPlatform.h"
 #include "fboss/agent/if/gen-cpp2/common_types.h"
+#include "fboss/agent/packet/EthHdr.h"
 #include "fboss/agent/state/AggregatePort.h"
 #include "fboss/agent/state/FibInfo.h"
 #include "fboss/agent/state/ForwardingInformationBase.h"
@@ -35,6 +36,7 @@
 #include "fboss/agent/test/CounterCache.h"
 #include "fboss/agent/test/HwTestHandle.h"
 #include "fboss/agent/test/RouteScaleGenerators.h"
+#include "fboss/agent/test/TestPacketFactory.h"
 #include "fboss/agent/test/TestUtils.h"
 #include "fboss/agent/test/utils/NextHopIdTestUtils.h"
 #include "fboss/lib/CommonUtils.h"
@@ -208,6 +210,32 @@ TEST_F(ThriftTest, getInterfaceDetail) {
   // Calling getInterfaceDetail() on an unknown
   // interface should throw an FbossError.
   EXPECT_THROW(handler.getInterfaceDetail(info, 123), FbossError);
+}
+
+TEST_F(ThriftTest, txPktL3WithNonzeroInterfaceIds) {
+  ThriftHandler handler(sw_);
+  ASSERT_EQ(
+      sw_->getState()->getInterfaces()->getNodeIf(InterfaceID(0)), nullptr);
+  ASSERT_NE(
+      sw_->getState()->getInterfaces()->getNodeIf(InterfaceID(1)), nullptr);
+
+  // No packets are sent: this checks interface selection without hardware I/O.
+  EXPECT_NO_THROW(handler.txPktL3(std::make_unique<folly::fbstring>(), 0, 0));
+}
+
+TEST_F(ThriftTest, txPktL3WithNonemptyPayload) {
+  ThriftHandler handler(sw_);
+  auto packet = createV6Packet(
+      IPAddressV6(kNhopAddrA),
+      IPAddressV6(kNhopAddrB),
+      kMacAddress,
+      kMacAddress);
+  // txPktL3 takes only the IP packet, without the Ethernet header.
+  auto payload = std::make_unique<folly::fbstring>(
+      reinterpret_cast<const char*>(packet.data() + EthHdr::SIZE),
+      packet.length() - EthHdr::SIZE);
+  ASSERT_FALSE(payload->empty());
+  EXPECT_NO_THROW(handler.txPktL3(std::move(payload), 1, 0));
 }
 
 TEST_F(ThriftTest, getPortInfoUserMetaData) {

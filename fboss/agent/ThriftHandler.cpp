@@ -3308,8 +3308,10 @@ void ThriftHandler::txPktL3(
   cfg::InterfaceType type{cfg::InterfaceType::VLAN};
   for (const auto& [_, intfs] : std::as_const(*interfaceMap)) {
     if (!intfs->empty()) {
-      intfID = intfs->at(0)->getID();
-      type = intfs->at(0)->getType();
+      // Map keys are interface IDs, not positions.
+      const auto& interface = intfs->cbegin()->second;
+      intfID = interface->getID();
+      type = interface->getType();
       break;
     }
   }
@@ -3326,6 +3328,8 @@ void ThriftHandler::txPktL3(
     unique_ptr<TxPacket> pkt = sw_->allocateL3TxPacket(
         static_cast<uint32_t>(payload->size()),
         (type == cfg::InterfaceType::VLAN));
+    // The allocated buffer has headroom but no payload data yet.
+    pkt->buf()->append(payload->size());
     RWPrivateCursor cursor(pkt->buf());
     cursor.push(StringPiece(*payload));
     sw_->sendL3Packet(std::move(pkt), *intfID);
