@@ -1605,6 +1605,57 @@ TEST_F(NdpTest, FlushOnAggPortTransition) {
       entry->getPort(), PortDescriptor(AggregatePortID(kAggregatePortID)));
 }
 
+TEST_F(NdpTest, UpdateNeighborEntryToAggregatePort) {
+  auto handle = this->setupTestHandle();
+  auto sw = handle->getSw();
+  const auto neighborAddr = IPAddressV6("2401:db00:2110:3004::b");
+  const auto neighborMac = MacAddress("02:05:73:f9:46:fb");
+  const auto intfID =
+      sw->getState()->getInterfaceIDForPort(PortDescriptor(PortID(1)));
+
+  // Configure the aggregate descriptor. The L3 traffic-loop setup seeds this
+  // neighbor with a physical descriptor, but NDP learning can update it with
+  // an aggregate descriptor.
+  auto config = createSwitchConfig(seconds(0), seconds(0), true);
+  sw->applyConfig("Add aggports", config);
+
+  sw->getNeighborUpdater()->receivedNdpMineForIntf(
+      intfID,
+      neighborAddr,
+      neighborMac,
+      PortDescriptor(PortID(1)),
+      ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
+      0);
+  sw->getNeighborUpdater()->waitForPendingUpdates();
+  waitForStateUpdates(sw);
+  auto entry = sw->getState()
+                   ->getInterfaces()
+                   ->getNodeIf(intfID)
+                   ->getNdpTable()
+                   ->getEntryIf(neighborAddr);
+  ASSERT_NE(entry, nullptr);
+  ASSERT_EQ(entry->getPort(), PortDescriptor(PortID(1)));
+
+  sw->getNeighborUpdater()->receivedNdpMineForIntf(
+      intfID,
+      neighborAddr,
+      neighborMac,
+      PortDescriptor(AggregatePortID(kAggregatePortID)),
+      ICMPv6Type::ICMPV6_TYPE_NDP_NEIGHBOR_ADVERTISEMENT,
+      ND_NA_FLAG_OVERRIDE);
+  sw->getNeighborUpdater()->waitForPendingUpdates();
+  waitForStateUpdates(sw);
+
+  entry = sw->getState()
+              ->getInterfaces()
+              ->getNodeIf(intfID)
+              ->getNdpTable()
+              ->getEntryIf(neighborAddr);
+  ASSERT_NE(entry, nullptr);
+  EXPECT_EQ(
+      entry->getPort(), PortDescriptor(AggregatePortID(kAggregatePortID)));
+}
+
 TEST_F(NdpTest, PendingNdp) {
   auto handle = this->setupTestHandleWithPortRif();
   auto sw = handle->getSw();
